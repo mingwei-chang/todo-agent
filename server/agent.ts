@@ -11,7 +11,6 @@ interface Task {
   done: boolean;
 }
 
-// 所有对任务 API 的调用都从这里走，统一处理错误。
 async function callTasksApi(method: string, path: string, body?: unknown): Promise<any> {
   const response = await fetch(`${TASKS_API}${path}`, {
     method,
@@ -38,7 +37,54 @@ function toModelMessages(messages: ChatMessage[]) {
   );
 }
 
+// 给模型看的清单：带汇总数字和 id，方便它指认要操作哪一条。
+function formatListing(tasks: Task[]): string {
+  if (tasks.length === 0) return "（当前没有任何任务）";
+
+  const pending = tasks.filter((task) => !task.done).length;
+  const lines = tasks
+    .map((task, index) => `${index + 1}. ${task.done ? "✅" : "□"} ${task.title}（id: ${task.id}）`)
+    .join("\n");
+
+  return `共 ${tasks.length} 条，待办 ${pending} 条，已完成 ${tasks.length - pending} 条：\n${lines}`;
+}
+
+// 给用户看的清单：由代码渲染，按状态分组、保留原始序号、不显示 id。
+function formatForUser(tasks: Task[]): string {
+  if (tasks.length === 0) return "你现在没有待办。";
+
+  const numbered = tasks.map((task, index) => ({ no: index + 1, task }));
+  const pending = numbered.filter((item) => !item.task.done);
+  const finished = numbered.filter((item) => item.task.done);
+
+  const parts = [`共 ${tasks.length} 条，待办 ${pending.length} 条，已完成 ${finished.length} 条。`];
+
+  if (pending.length > 0) {
+    parts.push("", "待办：");
+    for (const item of pending) parts.push(`${item.no}. □ ${item.task.title}`);
+  }
+
+  if (finished.length > 0) {
+    parts.push("", "已完成：");
+    for (const item of finished) parts.push(`${item.no}. ✅ ${item.task.title}`);
+  }
+
+  return parts.join("\n");
+}
+
 const TOOLS = [
+  {
+    type: "function" as const,
+    function: {
+      name: "listTasks",
+      description: "查看用户当前的待办清单。用户问'我有哪些任务''看看清单''还有什么没做'时调用。",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
   {
     type: "function" as const,
     function: {
@@ -96,16 +142,14 @@ const TOOLS = [
 ];
 
 const SYSTEM_PROMPT = `你是"小明"，一个中文待办清单助手。
-每次对话我都会告诉你用户当前的清单，你要据此回答。
+每次对话我都会告诉你用户当前的清单（含汇总数字和每条的序号），你要据此回答。
 
 规则：
-- 清单非空时按顺序列出，每条前面用 ⬜ 表示待办、✅ 表示已完成。
-- 清单为空时，直接说"你现在没有待办"。
+- 用户想查看清单时，必须调用 listTasks 工具，不要在回复里自己列出任务。
 - 只根据清单回答，绝不编造清单里没有的任务。
 - 创建、完成、删除任务时必须调用对应的工具，不要只在嘴上答应。
-- 用简短的中文口语回答，不要输出 JSON、表格或 Markdown。`;
+- 用简短的中文口语回答，不要输出 JSON 或 Markdown 表格。`;
 
-// 执行模型申请的单个工具调用，把结果说成一句给模型看的话。
 async function executeToolCall(call: {
   id: string;
   function: { name: string; arguments: string };
@@ -119,6 +163,9 @@ async function executeToolCall(call: {
 
   try {
     switch (call.function.name) {
+      case "listTasks": {
+        return formatForUser(await listTasks());
+      }
       case "addTask": {
         const task = await callTasksApi("POST", "", { title: args.title });
         return `已创建任务「${task.title}」，当前未完成，id=${task.id}`;
@@ -140,52 +187,64 @@ async function executeToolCall(call: {
 }
 
 export async function reply(messages: ChatMessage[]): Promise<string> {
-  const tasks = await listTasks();
-
-  const listing =
-    tasks.length === 0
-      ? "（当前没有任何任务）"
-      : tasks
-          .map(
-            (task, index) =>
-              `${index + 1}. ${task.done ? "✅" : "⬜"} ${task.title}（id: ${task.id}）`,
-          )
-          .join("\n");
-
+  const history = toModelMessages(messages);
   const client = getModelClient();
-  const conversation = [
-    { role: "system" as const, content: `${SYSTEM_PROMPT}\n\n当前清单：\n${listing}` },
-    ...toModelMessages(messages),
-  ];
 
-  // 第一轮：把清单和用户的话交给模型，看它想做什么。
+  // 第一轮：用当前清单做判断。
+  const before = formatListing(await listTasks());
   const first = await client.chat.completions.create({
     model,
-    messages: conversation,
+    messages: [
+      { role: "system" as const, content: `${SYSTEM_PROMPT}\n\n当前清单：\n${before}` },
+      ...history,
+    ],
     tools: TOOLS,
     tool_choice: "auto",
   });
 
   const plan = first.choices[0]?.message;
 
-  // 它不想动手，只是说话。
   if (!plan?.tool_calls?.length) {
     return plan?.content?.trim() || "抱歉，我没听明白。";
   }
 
-  // 它想动手：逐个执行，把结果收集成 tool 消息。
-  const results: { role: "tool"; tool_call_id: string; content: string }[] = [];
+  console.log(
+    "工具调用：",
+    plan.tool_calls.map((c) => `${c.function.name}(${c.function.arguments})`).join(" | "),
+  );
+
+  const executed: { name: string; callId: string; content: string }[] = [];
   for (const call of plan.tool_calls) {
-    const content = await executeToolCall(call);
-    results.push({ role: "tool", tool_call_id: call.id, content });
+    executed.push({
+      name: call.function.name,
+      callId: call.id,
+      content: await executeToolCall(call),
+    });
   }
 
-  // 第二轮：把执行结果交回去，让它组织一句人话。
+  // 用户只是想看清单：直接用代码渲染好的文本回复，不交给模型复述。
+  const listing = executed.find((item) => item.name === "listTasks");
+  if (listing) {
+    const others = executed.filter((item) => item.name !== "listTasks").map((item) => item.content);
+    return [...others, listing.content].join("\n\n");
+  }
+
+  // 第二轮：重新读一次清单，把最新的真实状态交给模型组织回复。
+  const after = formatListing(await listTasks());
   const second = await client.chat.completions.create({
     model,
-    messages: [...conversation, plan, ...results],
+    messages: [
+      { role: "system" as const, content: `${SYSTEM_PROMPT}\n\n当前清单（刚刚更新）：\n${after}` },
+      ...history,
+      plan,
+      ...executed.map((item) => ({
+        role: "tool" as const,
+        tool_call_id: item.callId,
+        content: item.content,
+      })),
+    ],
     tools: TOOLS,
-    tool_choice: "auto",
+    tool_choice: "none",
   });
 
   return second.choices[0]?.message?.content?.trim() || "已经处理好了。";
