@@ -3,14 +3,19 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { z } from "zod";
 
-const storedTask = z.looseObject({ id: z.string(), title: z.string(), done: z.boolean() });
+const storedTask = z.looseObject({
+  id: z.string(),
+  title: z.string(),
+  done: z.boolean(),
+  due: z.string().optional(),
+});
 const taskList = z.array(storedTask);
 type Task = z.infer<typeof storedTask>;
-type TaskChanges = Partial<Pick<Task, "title" | "done">>;
+type TaskChanges = Partial<Pick<Task, "title" | "done" | "due">>;
 
 export interface TaskStore {
   list(): Task[];
-  create(title: string): Task;
+  create(input: { title: string; due?: string }): Task;
   update(id: string, changes: TaskChanges): Task | undefined;
   remove(id: string): boolean;
 }
@@ -32,8 +37,9 @@ export function createJsonTaskStore(filename: string): TaskStore {
   return {
     list,
 
-    create(title) {
-      const task = { id: randomUUID(), title, done: false };
+    create(input) {
+      const task: Task = { id: randomUUID(), title: input.title, done: false };
+      if (input.due) task.due = input.due;
       save([...list(), task]);
       return task;
     },

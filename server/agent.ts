@@ -9,6 +9,7 @@ interface Task {
   id: string;
   title: string;
   done: boolean;
+  due?: string;
 }
 
 async function callTasksApi(method: string, path: string, body?: unknown): Promise<any> {
@@ -37,13 +38,42 @@ function toModelMessages(messages: ChatMessage[]) {
   );
 }
 
-// 给模型看的清单：带汇总数字和 id，方便它指认要操作哪一条。
+// 服务器本地日期，格式 YYYY-MM-DD。
+// 不能用 toISOString：那是 UTC，东八区晚上八点之后会差一天。
+function today(): string {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
+function daysBetween(from: string, to: string): number {
+  const start = Date.parse(`${from}T00:00:00`);
+  const end = Date.parse(`${to}T00:00:00`);
+  return Math.round((end - start) / 86400000);
+}
+
+// 到期日的展示后缀。今天到期算"还能做"，过了今天才算逾期。
+function dueLabel(task: Task): string {
+  if (!task.due) return "";
+
+  const now = today();
+  if (task.done) return `（${task.due}）`;
+  if (task.due > now) return `（${task.due} 到期）`;
+  if (task.due === now) return "（今天到期）";
+  return `（已逾期 ${daysBetween(task.due, now)} 天）`;
+}
+
+// 给模型看的清单：带汇总数字、到期日和 id，方便它指认要操作哪一条。
 function formatListing(tasks: Task[]): string {
   if (tasks.length === 0) return "（当前没有任何任务）";
 
   const pending = tasks.filter((task) => !task.done).length;
   const lines = tasks
-    .map((task, index) => `${index + 1}. ${task.done ? "✅" : "□"} ${task.title}（id: ${task.id}）`)
+    .map(
+      (task, index) =>
+        `${index + 1}. ${task.done ? "✅" : "□"} ${task.title}${dueLabel(task)}（id: ${task.id}）`,
+    )
     .join("\n");
 
   return `共 ${tasks.length} 条，待办 ${pending} 条，已完成 ${tasks.length - pending} 条：\n${lines}`;
@@ -61,12 +91,43 @@ function formatForUser(tasks: Task[]): string {
 
   if (pending.length > 0) {
     parts.push("", "待办：");
-    for (const item of pending) parts.push(`${item.no}. □ ${item.task.title}`);
+    for (const item of pending) parts.push(`${item.no}. □ ${item.task.title}${dueLabel(item.task)}`);
   }
 
   if (finished.length > 0) {
     parts.push("", "已完成：");
     for (const item of finished) parts.push(`${item.no}. ✅ ${item.task.title}`);
+  }
+
+  return parts.join("\n");
+}
+
+// 今天到期 + 已逾期。已完成的、没有到期日的、以后的都不算。
+function formatDueList(tasks: Task[]): string {
+  const now = today();
+  const numbered = tasks.map((task, index) => ({ no: index + 1, task }));
+  const scheduled = numbered.filter((item) => !item.task.done && item.task.due);
+  const dueToday = scheduled.filter((item) => item.task.due === now);
+  const overdue = scheduled.filter((item) => (item.task.due as string) < now);
+
+  if (dueToday.length === 0 && overdue.length === 0) {
+    return "今天没有到期的任务，也没有逾期的。";
+  }
+
+  const parts: string[] = [];
+
+  if (dueToday.length > 0) {
+    parts.push("今天到期（今天还能做）：");
+    for (const item of dueToday) parts.push(`${item.no}. □ ${item.task.title}`);
+  }
+
+  if (overdue.length > 0) {
+    if (parts.length > 0) parts.push("");
+    parts.push("已逾期：");
+    for (const item of overdue) {
+      const days = daysBetween(item.task.due as string, now);
+      parts.push(`${item.no}. □ ${item.task.title}（逾期 ${days} 天）`);
+    }
   }
 
   return parts.join("\n");
@@ -88,6 +149,19 @@ const TOOLS = [
   {
     type: "function" as const,
     function: {
+      name: "listDueTasks",
+      description:
+        "查看今天到期和已经逾期的未完成任务。用户问'今天有什么到期''有没有过期的''最近要交什么'时调用。",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
       name: "addTask",
       description: "新增一条待办任务。用户说'记一下''提醒我''别忘了'时使用。",
       parameters: {
@@ -96,6 +170,11 @@ const TOOLS = [
           title: {
             type: "string",
             description: "任务标题，只保留任务本身，比如'买牛奶'，不要带'帮我记一下'。",
+          },
+          due: {
+            type: "string",
+            description:
+              "到期日，格式 YYYY-MM-DD。用户说了截止时间才填，没提就不要填这个字段。",
           },
         },
         required: ["title"],
@@ -164,14 +243,18 @@ const TOOLS = [
   },
 ];
 
-const SYSTEM_PROMPT = `你是"小明"，一个中文待办清单助手。
-每次对话我都会告诉你用户当前的清单（含汇总数字和每条的序号），你要据此回答。
+function buildSystemPrompt(todayDate: string): string {
+  return `你是"小明"，一个中文待办清单助手。
+今天的日期是 ${todayDate}。每次对话我都会告诉你用户当前的清单（含汇总数字、每条的序号和到期日），你要据此回答。
 
 规则：
 - 用户想查看清单时，必须调用 listTasks 工具，不要在回复里自己列出任务。
+- 用户问到"有哪些到期""有没有逾期"时，必须调用 listDueTasks 工具。
+- 用户提到"明天""后天""下周三"这类时间时，你按今天的日期换算成 YYYY-MM-DD 填进 due；用户没提到期时间就不要填。
 - 只根据清单回答，绝不编造清单里没有的任务。
 - 创建、完成、删除、修改标题时必须调用对应的工具，不要只在嘴上答应。
 - 用简短的中文口语回答，不要输出 JSON 或 Markdown 表格。`;
+}
 
 async function executeToolCall(call: {
   id: string;
@@ -189,9 +272,14 @@ async function executeToolCall(call: {
       case "listTasks": {
         return formatForUser(await listTasks());
       }
+      case "listDueTasks": {
+        return formatDueList(await listTasks());
+      }
       case "addTask": {
-        const task = await callTasksApi("POST", "", { title: args.title });
-        return `已创建任务「${task.title}」，当前未完成，id=${task.id}`;
+        const body: { title: string; due?: string } = { title: args.title };
+        if (args.due) body.due = args.due;
+        const task = await callTasksApi("POST", "", body);
+        return `已创建任务「${task.title}」${task.due ? `，到期日 ${task.due}` : ""}，当前未完成，id=${task.id}`;
       }
       case "completeTask": {
         const task = await callTasksApi("PATCH", `/${args.taskId}`, { done: true });
@@ -219,11 +307,12 @@ const MAX_ROUNDS = 4;
 export async function reply(messages: ChatMessage[]): Promise<string> {
   const history = toModelMessages(messages);
   const client = getModelClient();
+  const systemPrompt = buildSystemPrompt(today());
 
   const conversation: any[] = [
     {
       role: "system" as const,
-      content: `${SYSTEM_PROMPT}\n\n当前清单：\n${formatListing(await listTasks())}`,
+      content: `${systemPrompt}\n\n当前清单：\n${formatListing(await listTasks())}`,
     },
     ...history,
   ];
@@ -259,8 +348,11 @@ export async function reply(messages: ChatMessage[]): Promise<string> {
     }
     lastResults = executed.map((item) => item.content);
 
-    // 第一轮只查清单：直接用代码渲染的文本回复，不交给模型复述。
-    if (round === 1 && executed.every((item) => item.name === "listTasks")) {
+    // 第一轮只是查询（看清单或看到期）：直接用代码渲染的文本回复，不交给模型复述。
+    const isQuery = executed.every(
+      (item) => item.name === "listTasks" || item.name === "listDueTasks",
+    );
+    if (round === 1 && isQuery) {
       return executed[executed.length - 1].content;
     }
 
