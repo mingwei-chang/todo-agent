@@ -139,6 +139,29 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "renameTask",
+      description:
+        "修改一条已有任务的标题，任务本身保留不变。用户说'把XX改成YY''XX 改成 YY'时使用。不要用先删除再新建的方式模拟改名。",
+      parameters: {
+        type: "object",
+        properties: {
+          taskId: {
+            type: "string",
+            description: "目标任务的 id，必须从当前清单里原样复制，不要自己编。",
+          },
+          title: {
+            type: "string",
+            description: "新的任务标题，只保留任务本身的内容，不要带'改成'这类字眼。",
+          },
+        },
+        required: ["taskId", "title"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 const SYSTEM_PROMPT = `你是"小明"，一个中文待办清单助手。
@@ -147,7 +170,7 @@ const SYSTEM_PROMPT = `你是"小明"，一个中文待办清单助手。
 规则：
 - 用户想查看清单时，必须调用 listTasks 工具，不要在回复里自己列出任务。
 - 只根据清单回答，绝不编造清单里没有的任务。
-- 创建、完成、删除任务时必须调用对应的工具，不要只在嘴上答应。
+- 创建、完成、删除、修改标题时必须调用对应的工具，不要只在嘴上答应。
 - 用简短的中文口语回答，不要输出 JSON 或 Markdown 表格。`;
 
 async function executeToolCall(call: {
@@ -177,6 +200,10 @@ async function executeToolCall(call: {
       case "deleteTask": {
         await callTasksApi("DELETE", `/${args.taskId}`);
         return "任务已删除。";
+      }
+      case "renameTask": {
+        const task = await callTasksApi("PATCH", `/${args.taskId}`, { title: args.title });
+        return `任务已改名为「${task.title}」。`;
       }
       default:
         return `没有这个工具：${call.function.name}`;
