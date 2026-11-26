@@ -186,66 +186,62 @@ async function executeToolCall(call: {
   }
 }
 
+// 最多允许模型连续调用工具的轮数。
+const MAX_ROUNDS = 4;
+
 export async function reply(messages: ChatMessage[]): Promise<string> {
   const history = toModelMessages(messages);
   const client = getModelClient();
 
-  // 第一轮：用当前清单做判断。
-  const before = formatListing(await listTasks());
-  const first = await client.chat.completions.create({
-    model,
-    messages: [
-      { role: "system" as const, content: `${SYSTEM_PROMPT}\n\n当前清单：\n${before}` },
-      ...history,
-    ],
-    tools: TOOLS,
-    tool_choice: "auto",
-  });
+  const conversation: any[] = [
+    {
+      role: "system" as const,
+      content: `${SYSTEM_PROMPT}\n\n当前清单：\n${formatListing(await listTasks())}`,
+    },
+    ...history,
+  ];
 
-  const plan = first.choices[0]?.message;
+  let lastResults: string[] = [];
 
-  if (!plan?.tool_calls?.length) {
-    return plan?.content?.trim() || "抱歉，我没听明白。";
-  }
-
-  console.log(
-    "工具调用：",
-    plan.tool_calls.map((c) => `${c.function.name}(${c.function.arguments})`).join(" | "),
-  );
-
-  const executed: { name: string; callId: string; content: string }[] = [];
-  for (const call of plan.tool_calls) {
-    executed.push({
-      name: call.function.name,
-      callId: call.id,
-      content: await executeToolCall(call),
+  for (let round = 1; round <= MAX_ROUNDS; round += 1) {
+    const completion = await client.chat.completions.create({
+      model,
+      messages: conversation,
+      tools: TOOLS,
+      tool_choice: "auto",
     });
+
+    const message = completion.choices[0]?.message;
+
+    if (!message?.tool_calls?.length) {
+      return message?.content?.trim() || "抱歉，我没听明白。";
+    }
+
+    console.log(
+      "工具调用：",
+      message.tool_calls.map((c) => `${c.function.name}(${c.function.arguments})`).join(" | "),
+    );
+
+    const executed: { name: string; callId: string; content: string }[] = [];
+    for (const call of message.tool_calls) {
+      executed.push({
+        name: call.function.name,
+        callId: call.id,
+        content: await executeToolCall(call),
+      });
+    }
+    lastResults = executed.map((item) => item.content);
+
+    // 第一轮只查清单：直接用代码渲染的文本回复，不交给模型复述。
+    if (round === 1 && executed.every((item) => item.name === "listTasks")) {
+      return executed[executed.length - 1].content;
+    }
+
+    conversation.push(message);
+    for (const item of executed) {
+      conversation.push({ role: "tool" as const, tool_call_id: item.callId, content: item.content });
+    }
   }
 
-  // 用户只是想看清单：直接用代码渲染好的文本回复，不交给模型复述。
-  const listing = executed.find((item) => item.name === "listTasks");
-  if (listing) {
-    const others = executed.filter((item) => item.name !== "listTasks").map((item) => item.content);
-    return [...others, listing.content].join("\n\n");
-  }
-
-  // 第二轮：重新读一次清单，把最新的真实状态交给模型组织回复。
-  const after = formatListing(await listTasks());
-  const second = await client.chat.completions.create({
-    model,
-    messages: [
-      { role: "system" as const, content: `${SYSTEM_PROMPT}\n\n当前清单（刚刚更新）：\n${after}` },
-      ...history,
-      plan,
-      ...executed.map((item) => ({
-        role: "tool" as const,
-        tool_call_id: item.callId,
-        content: item.content,
-      })),
-    ],
-    tools: TOOLS,
-    tool_choice: "none",
-  });
-
-  return second.choices[0]?.message?.content?.trim() || "已经处理好了。";
+  return lastResults.join("\n\n") || "抱歉，这一步我没能完成。";
 }
